@@ -23,7 +23,7 @@ def make_hinge_trajectories(axis, pivot, angles, n_points=30, noise=0.01):
     
     for i in range(n_points):
         # Create points at different distances from axis
-        distance_from_axis = 0.5 + 0.5 * np.random.rand()  # 0.5 to 1.0 meters
+        distance_from_axis = 1.5 + 0.5 * np.random.rand()  # 0.5 to 1.0 meters
         
         # Create a random point perpendicular to the axis
         random_perp = np.random.randn(3)

@@ -103,6 +103,7 @@ class JointModelBase(ABC):
         return True
 
 
+
 class HingeJointModel(JointModelBase):
     """
     Model for hinge/revolute joints.
@@ -121,94 +122,148 @@ class HingeJointModel(JointModelBase):
     
     def fit_from_sample(self, trajectory_sample: List[Trajectory3D]) -> Optional[HingeParameters]:
         """
-        Fit hinge parameters from trajectory sample.
+        Fit hinge parameters using the Mobility Fitting approach from Li & Wan 2016.
         
-        Algorithm:
-        1. Extract point correspondences between two time steps
-        2. Use Kabsch algorithm or similar to find rotation matrix R
-        3. Extract rotation axis from R
-        4. Find pivot point on the axis
+        Algorithm (following paper exactly):
+        1. Extract rigid transformation M=(R,t) between two frames
+        2. Hinge axis = eigenvector of R with eigenvalue 1
+        3. Hinge pivot c from: (I-R)c = t
         """
         if not self.validate_sample(trajectory_sample):
             return None
         
         try:
-            # Get point correspondences from trajectories
-            points_t1, points_t2 = self._extract_point_correspondences(trajectory_sample)
+            # Use first trajectory with sufficient length
+            traj = None
+            for t in trajectory_sample:
+                if len(t.points) >= 2:
+                    traj = t
+                    break
             
-            if len(points_t1) < 3:  # Need at least 3 point pairs
+            if traj is None:
                 return None
             
-            # Estimate rotation and translation using procrustes analysis
-            R, t, pivot, axis = self._estimate_rigid_transform(points_t1, points_t2)
+            # Get two frames from trajectory (first and last for maximum motion)
+            points_i = np.array([traj.points[0].x, traj.points[0].y, traj.points[0].z])
+            points_j = np.array([traj.points[-1].x, traj.points[-1].y, traj.points[-1].z])
             
+            # For multiple trajectories, collect point correspondences
+            if len(trajectory_sample) > 1:
+                points_t1 = []
+                points_t2 = []
+                
+                for t in trajectory_sample:
+                    if len(t.points) >= 2:
+                        p1 = np.array([t.points[0].x, t.points[0].y, t.points[0].z])
+                        p2 = np.array([t.points[-1].x, t.points[-1].y, t.points[-1].z])
+                        points_t1.append(p1)
+                        points_t2.append(p2)
+                
+                if len(points_t1) < 2:
+                    return None
+                    
+                points_t1 = np.array(points_t1)
+                points_t2 = np.array(points_t2)
+            else:
+                # Single trajectory - create artificial correspondence
+                points_t1 = points_i.reshape(1, -1)
+                points_t2 = points_j.reshape(1, -1)
+            
+            # Estimate rigid transformation M = (R, t) using Procrustes/Kabsch
+            R, t = self._estimate_rigid_transform_kabsch(points_t1, points_t2)
+            
+            # Extract hinge axis (eigenvector of R with eigenvalue 1)
+            axis = self._extract_rotation_axis(R)
             if axis is None:
                 return None
+            
+            # Find pivot point: (I - R)c = t
+            pivot = self._solve_pivot_point(R, t)
             
             return HingeParameters(axis=axis, pivot=pivot)
             
         except Exception as e:
-            # Fitting failed - this is normal in RANSAC
             return None
     
-    def _extract_point_correspondences(self, 
-                                     trajectories: List[Trajectory3D]) -> Tuple[np.ndarray, np.ndarray]:
-        """Extract corresponding 3D points from different time steps."""
-        points_t1 = []
-        points_t2 = []
-        
-        for traj in trajectories:
-            if len(traj.points) < 2:
-                continue
-            
-            # Take first and last points for maximum motion
-            p1 = traj.points[0]
-            p2 = traj.points[-1]
-            
-            points_t1.append([p1.x, p1.y, p1.z])
-            points_t2.append([p2.x, p2.y, p2.z])
-        
-        return np.array(points_t1), np.array(points_t2)
-    
-    def _estimate_rigid_transform(self, 
-                                points_t1: np.ndarray, 
-                                points_t2: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    def _estimate_rigid_transform_kabsch(self, points_t1: np.ndarray, points_t2: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Estimate rigid transformation between two point sets.
+        Estimate rigid transformation using Kabsch algorithm (SVD-based Procrustes).
+        Following Li & Wan 2016 equation: M = argmin_{R,t} Σ ||p_i^b - (Rp_i^a + t)||^2
         
         Returns:
-            R: Rotation matrix (3x3)
-            t: Translation vector (3,)
-            pivot: Pivot point on rotation axis (3,)
-            axis: Rotation axis unit vector (3,)
+            R: 3x3 rotation matrix
+            t: 3D translation vector
         """
         # Center the point sets
-        centroid_t1 = np.mean(points_t1, axis=0)
-        centroid_t2 = np.mean(points_t2, axis=0)
+        centroid_1 = np.mean(points_t1, axis=0)
+        centroid_2 = np.mean(points_t2, axis=0)
         
-        centered_t1 = points_t1 - centroid_t1
-        centered_t2 = points_t2 - centroid_t2
+        centered_1 = points_t1 - centroid_1
+        centered_2 = points_t2 - centroid_2
         
-        # Use Kabsch algorithm to find optimal rotation
-        H = centered_t1.T @ centered_t2
+        # Compute cross-covariance matrix H
+        H = centered_1.T @ centered_2
+        
+        # SVD decomposition
         U, S, Vt = np.linalg.svd(H)
         R = Vt.T @ U.T
         
-        # Ensure proper rotation (det(R) = 1)
+        # Ensure proper rotation matrix (det(R) = 1)
         if np.linalg.det(R) < 0:
             Vt[-1, :] *= -1
             R = Vt.T @ U.T
         
-        # Calculate translation
-        t = centroid_t2 - R @ centroid_t1
+        # Compute translation
+        t = centroid_2 - R @ centroid_1
         
-        # Extract rotation axis and angle
-        axis, angle = self._rotation_matrix_to_axis_angle(R)
+        return R, t
+    
+    def _extract_rotation_axis(self, R: np.ndarray) -> Optional[np.ndarray]:
+        """
+        Extract rotation axis from rotation matrix.
+        Following Li & Wan 2016: "hinge direction a is the eigenvector of R with eigenvalue 1"
+        """
+        try:
+            # Find eigenvector corresponding to eigenvalue 1
+            eigenvalues, eigenvectors = np.linalg.eig(R)
+            
+            # Find eigenvalue closest to 1
+            closest_to_1 = np.argmin(np.abs(eigenvalues - 1.0))
+            
+            if np.abs(eigenvalues[closest_to_1] - 1.0) > 0.1:
+                # Not a good rotation matrix for hinge
+                return None
+            
+            axis = eigenvectors[:, closest_to_1].real
+            
+            # Ensure it's a unit vector
+            axis = axis / np.linalg.norm(axis)
+            
+            return axis
+            
+        except Exception:
+            return None
+    
+    def _solve_pivot_point(self, R: np.ndarray, t: np.ndarray) -> np.ndarray:
+        """
+        Solve for pivot point using Li & Wan 2016 equation: (I - R)c = t
+        """
+        I = np.eye(3)
+        A = I - R
         
-        # Find pivot point (point on axis closest to centroids)
-        pivot = self._find_pivot_point(centroid_t1, centroid_t2, axis, R)
-        
-        return R, t, pivot, axis
+        # Solve linear system (I - R)c = t
+        try:
+            # Use least squares since the system may be under-constrained
+            pivot, residuals, rank, s = np.linalg.lstsq(A, t, rcond=None)
+            return pivot
+        except np.linalg.LinAlgError:
+            # If direct solution fails, find minimum norm solution
+            try:
+                pivot = np.linalg.pinv(A) @ t
+                return pivot
+            except:
+                # Fallback: use translation centroid
+                return t / 2
     
     def _rotation_matrix_to_axis_angle(self, R: np.ndarray) -> Tuple[np.ndarray, float]:
         """Convert rotation matrix to axis-angle representation."""
@@ -273,45 +328,86 @@ class HingeJointModel(JointModelBase):
     
     def calculate_trajectory_error(self, trajectory: Trajectory3D, joint_params: HingeParameters) -> float:
         """
-        Calculate RMS error for trajectory fitting hinge model.
+        Calculate fitting error following Li & Wan 2016 Equation 11:
+        D_h(f_i, f_k) = min_θ ||M_{h,θ} p_i - p_k||
         
-        For each point in trajectory, find the rotation angle that best explains
-        its position, then calculate error.
+        Key insight: For hinge motion, we test if 80% of trajectory lifespan 
+        can be explained by rotation around the hinge axis.
         """
         if len(trajectory.points) < 2:
             return float('inf')
         
         points = trajectory.get_all_positions()
+        reference_point = points[0]  # Use first frame as reference
         
-        # Calculate distance from each point to the rotation axis
-        distances_to_axis = []
+        valid_fits = 0
+        total_frames = len(points) - 1  # Exclude reference frame
+        errors = []
         
-        for point in points:
-            # Distance from point to line (axis through pivot)
-            # Formula: ||(point - pivot) - ((point - pivot) · axis) * axis||
+        for i, current_point in enumerate(points[1:], 1):
+            # Find optimal rotation angle θ that minimizes ||M_{h,θ} p_i - p_k||
+            min_error = self._find_optimal_hinge_angle(
+                reference_point, current_point, 
+                joint_params.axis, joint_params.pivot
+            )
             
-            point_to_pivot = point - joint_params.pivot
-            projection_on_axis = np.dot(point_to_pivot, joint_params.axis) * joint_params.axis
-            perpendicular_component = point_to_pivot - projection_on_axis
-            distance_to_axis = np.linalg.norm(perpendicular_component)
+            errors.append(min_error)
             
-            distances_to_axis.append(distance_to_axis)
+            # Following paper: point supports hinge if error < threshold
+            if min_error <= 0.05:  # εh = 0.05 from paper
+                valid_fits += 1
         
-        # For a perfect hinge, all distances should be the same
-        distances_to_axis = np.array(distances_to_axis)
+        # Following paper: "discard hinge if supporting points < 80% of lifespan"
+        support_ratio = valid_fits / total_frames if total_frames > 0 else 0
         
-        # Error is the standard deviation of distances (should be close to 0)
-        if len(distances_to_axis) < 2:
-            return float('inf')
+        if support_ratio < 0.8:
+            return float('inf')  # Reject this hinge
         
-        error = np.std(distances_to_axis)
+        # Return average error for valid trajectory
+        return np.mean(errors)
+    
+    def _find_optimal_hinge_angle(self, 
+                                 p_reference: np.ndarray,
+                                 p_current: np.ndarray, 
+                                 axis: np.ndarray, 
+                                 pivot: np.ndarray) -> float:
+        """
+        Find rotation angle θ that minimizes ||M_{h,θ} p_reference - p_current||
+        This implements the min_θ part of Equation 11.
+        """
+        # Translate points so pivot is at origin
+        p_ref_centered = p_reference - pivot
+        p_cur_centered = p_current - pivot
         
-        # Also add a small penalty for very small movements (static points)
-        total_movement = np.linalg.norm(points[-1] - points[0])
-        if total_movement < 0.01:  # Less than 1cm movement
-            error += 0.1  # Add penalty
+        # Project points onto plane perpendicular to rotation axis
+        p_ref_proj = p_ref_centered - np.dot(p_ref_centered, axis) * axis
+        p_cur_proj = p_cur_centered - np.dot(p_cur_centered, axis) * axis
         
-        return error
+        # Check if both points are essentially on the axis (no rotation possible)
+        if np.linalg.norm(p_ref_proj) < 1e-6 or np.linalg.norm(p_cur_proj) < 1e-6:
+            # Points are on the rotation axis - just check distance consistency
+            return np.linalg.norm(p_cur_centered - p_ref_centered)
+        
+        # Find optimal rotation angle between projected vectors
+        cos_angle = np.dot(p_ref_proj, p_cur_proj) / (
+            np.linalg.norm(p_ref_proj) * np.linalg.norm(p_cur_proj)
+        )
+        cos_angle = np.clip(cos_angle, -1, 1)
+        optimal_angle = np.arccos(cos_angle)
+        
+        # Check both positive and negative angles
+        angles_to_test = [optimal_angle, -optimal_angle]
+        min_error = float('inf')
+        
+        for angle in angles_to_test:
+            # Apply rotation M_{h,θ}
+            rotated_point = self._rotate_point_around_axis(
+                p_reference, pivot, axis, angle
+            )
+            error = np.linalg.norm(rotated_point - p_current)
+            min_error = min(min_error, error)
+        
+        return min_error
     
     def _estimate_rotation_angle(self, 
                                point1: np.ndarray, 
@@ -388,77 +484,114 @@ class SliderJointModel(JointModelBase):
         return 1
     
     def fit_from_sample(self, trajectory_sample: List[Trajectory3D]) -> Optional[SliderParameters]:
+        """
+        Fit slider parameters from trajectory sample.
+        
+        Algorithm:
+        1. Calculate displacement vectors for each trajectory
+        2. Average them to get slide direction
+        3. Normalize to get unit direction vector
+        """
         if not self.validate_sample(trajectory_sample):
             return None
-
-        displacements = []
-        start_points = []
-
-        for traj in trajectory_sample:
-            pts = traj.get_all_positions()
-            if len(pts) < 2:
-                continue
-            start_points.append(pts[0])
-            displacements.extend(np.diff(pts, axis=0))  # use all steps
-
-        if len(displacements) == 0:
+        
+        try:
+            displacement_vectors = []
+            
+            for traj in trajectory_sample:
+                if len(traj.points) < 2:
+                    continue
+                
+                # Calculate displacement from first to last point
+                p1 = traj.points[0]
+                p2 = traj.points[-1]
+                
+                displacement = np.array([p2.x - p1.x, p2.y - p1.y, p2.z - p1.z])
+                
+                if np.linalg.norm(displacement) > 1e-6:  # Avoid zero displacements
+                    displacement_vectors.append(displacement)
+            
+            if len(displacement_vectors) == 0:
+                return None
+            
+            # Average displacement vectors and normalize
+            avg_displacement = np.mean(displacement_vectors, axis=0)
+            direction = avg_displacement / np.linalg.norm(avg_displacement)
+            
+            # Use first trajectory's first point as reference
+            reference_point = np.array([
+                trajectory_sample[0].points[0].x,
+                trajectory_sample[0].points[0].y,
+                trajectory_sample[0].points[0].z
+            ])
+            
+            return SliderParameters(
+                direction=direction,
+                reference_point=reference_point
+            )
+            
+        except Exception as e:
             return None
-
-        displacements = np.vstack(displacements)
-        # PCA on displacements
-        U, S, Vt = np.linalg.svd(displacements)
-        direction = Vt[0] / np.linalg.norm(Vt[0])
-
-        reference_point = np.mean(start_points, axis=0)
-
-        return SliderParameters(direction=direction, reference_point=reference_point)
-
     
     def calculate_trajectory_error(self, trajectory: Trajectory3D, joint_params: SliderParameters) -> float:
         """
-        Calculate error for trajectory fitting slider model.
+        Calculate fitting error following Li & Wan 2016 Equation 12:
+        D_v(f_i, f_k) = min_τ ||p_i + τv - p_k||
         
-        For slider motion, check that all displacements are parallel to slide direction
-        and that the trajectory shows actual translation movement.
+        For slider joint, motion should be pure translation along direction v.
         """
         if len(trajectory.points) < 2:
             return float('inf')
         
         points = trajectory.get_all_positions()
+        reference_point = points[0]  # Use first frame as reference
         
-        # Calculate frame-to-frame displacements
-        displacements = np.diff(points, axis=0)
-        
-        if len(displacements) == 0:
-            return float('inf')
-        
+        valid_fits = 0
+        total_frames = len(points) - 1
         errors = []
         
-        for displacement in displacements:
-            displacement_magnitude = np.linalg.norm(displacement)
+        for current_point in points[1:]:
+            # Find optimal translation distance τ that minimizes ||p_i + τv - p_k||
+            min_error = self._find_optimal_translation_distance(
+                reference_point, current_point, joint_params.direction
+            )
             
-            # Skip very small displacements (noise)
-            if displacement_magnitude < 1e-6:
-                continue
+            errors.append(min_error)
             
-            # Project displacement onto slide direction
-            projected_length = np.dot(displacement, joint_params.direction)
-            predicted_displacement = projected_length * joint_params.direction
-            
-            # Error is the perpendicular component (deviation from pure translation)
-            error_vector = displacement - predicted_displacement
-            error = np.linalg.norm(error_vector)
-            errors.append(error)
+            # Following paper: point supports slider if error < threshold
+            if min_error <= 0.05:  # εv = 0.05 from paper
+                valid_fits += 1
         
-        if len(errors) == 0:
-            return float('inf')
+        # Following paper: "discard slider if supporting points < 80% of lifespan"
+        support_ratio = valid_fits / total_frames if total_frames > 0 else 0
         
-        # Add penalty for trajectories that don't show significant translation
-        total_displacement = np.linalg.norm(points[-1] - points[0])
-        if total_displacement < 0.02:  # Less than 2cm total movement
-            return float('inf')  # Not a good slider candidate
+        if support_ratio < 0.8:
+            return float('inf')  # Reject this slider
         
+        # Return average error for valid trajectory
         return np.mean(errors)
+    
+    def _find_optimal_translation_distance(self, 
+                                         p_reference: np.ndarray,
+                                         p_current: np.ndarray,
+                                         direction: np.ndarray) -> float:
+        """
+        Find translation distance τ that minimizes ||p_reference + τ*direction - p_current||
+        This implements the min_τ part of Equation 12.
+        """
+        # Displacement from reference to current
+        displacement = p_current - p_reference
+        
+        # Optimal translation distance is projection of displacement onto direction
+        optimal_tau = np.dot(displacement, direction)
+        
+        # Predicted position after optimal translation
+        predicted_point = p_reference + optimal_tau * direction
+        
+        # Error is distance from predicted to actual position
+        error = np.linalg.norm(predicted_point - p_current)
+        
+        return error
     
     def refine_parameters(self, 
                          inlier_trajectories: List[Trajectory3D], 
@@ -508,6 +641,7 @@ def get_joint_model(joint_type: JointType) -> Optional[JointModelBase]:
     """Get a specific joint model by type."""
     models = create_joint_models()
     return models.get(joint_type)
+
 
 
 
