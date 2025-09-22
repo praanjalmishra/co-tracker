@@ -367,11 +367,11 @@ if __name__ == "__main__":
     result = estimate_joint_from_trajectories(trajectories, config)
 
     if result.success:
-        print(f"\n✅ RANSAC Success: {result.joint_type.value}")
+        print(f"\n RANSAC Success: {result.joint_type.value}")
         print("Parameters:", result.parameters)
         print(f"Inliers: {len(result.inlier_trajectories)} / {len(trajectories)}")
     else:
-        print(f"\n❌ RANSAC Failed: {result.error_message}")
+        print(f"\nRANSAC Failed: {result.error_message}")
 
     # --- Visualization ---
     fig = plt.figure()

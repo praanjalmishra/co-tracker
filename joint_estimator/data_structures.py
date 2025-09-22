@@ -296,9 +296,9 @@ def trajectory_2d_to_3d(traj_2d: Trajectory2D,
     )
 
 
-def create_default_config(fx: float, fy: float, cx: float, cy: float) -> PipelineConfig:
+def create_default_config(fx: float, fy: float, cx: float, cy: float, w: int, h: int) -> PipelineConfig:
     """Create a default pipeline configuration."""
-    camera_intrinsics = CameraIntrinsics(fx=fx, fy=fy, cx=cx, cy=cy)
+    camera_intrinsics = CameraIntrinsics(fx=fx, fy=fy, cx=cx, cy=cy, w=w, h=h)
     ransac_config = RANSACConfig()
     trajectory_filter_config = TrajectoryFilterConfig()
     
