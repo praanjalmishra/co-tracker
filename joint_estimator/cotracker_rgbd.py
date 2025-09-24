@@ -26,6 +26,7 @@ from data_structures import (
 )
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
+from sklearn.cluster import DBSCAN
 
 DEFAULT_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -127,14 +128,22 @@ class CoTrackerRGBD:
         print("Step 7: Segmenting rigid parts...")
         segmented_trajectories = self._segment_rigid_parts(filtered_trajectories)
 
+        # Keep only moving trajectories
+        moving_trajectories = [traj for traj in segmented_trajectories if traj.rigid_part == 1]
+        print(f"Using only moving trajectories: {len(moving_trajectories)} out of {len(segmented_trajectories)}")
+
+        # # Step 8: Cluster trajectories (only moving ones)
+        # print("Step 8: Clustering trajectories...")
+        # clustered_trajectories = self._cluster_trajectories(moving_trajectories)
+
         # visualize the trajectories
 
         self.visualize_result(out_dir=out_dir)
 
-        plot_trajectories_3d(segmented_trajectories, out_path="./saved_videos/trajectories_3d.png")
+        plot_trajectories_3d(moving_trajectories, out_path="./saved_videos/trajectories_3d.png")
 
         print("=== RGB-D Processing Complete ===")
-        return segmented_trajectories, camera_intrinsics
+        return moving_trajectories, camera_intrinsics
     
     def _load_and_preprocess_video(self, video_path: str) -> Tuple[torch.Tensor, int, int, int]:
         """Load and preprocess RGB video with memory optimization."""
@@ -361,55 +370,121 @@ class CoTrackerRGBD:
             rigid_part=trajectory.rigid_part
         )
     
+
+
     def _segment_rigid_parts(self, trajectories_3d: List[Trajectory3D]) -> List[Trajectory3D]:
         """
         Segment trajectories into rigid parts (moving vs static).
-        
-        This is a simplified implementation that uses motion magnitude.
-        More sophisticated methods could use clustering or motion analysis.
+        More robust version using displacement, velocity variance, and clustering.
         """
+        from sklearn.cluster import KMeans
+        
         if not trajectories_3d:
             return trajectories_3d
-        
-        motion_magnitudes = []
-        
-        # Calculate motion magnitude for each trajectory
+
+        features = []
         for traj in trajectories_3d:
             positions = traj.get_all_positions()
             if len(positions) < 2:
-                motion_magnitudes.append(0.0)
+                features.append([0, 0, 0])
                 continue
-            
-            # Total displacement over the sequence
-            total_displacement = np.linalg.norm(positions[-1] - positions[0])
-            
-            # Average frame-to-frame motion
-            displacements = np.linalg.norm(np.diff(positions, axis=0), axis=1)
-            avg_frame_motion = np.mean(displacements)
-            
-            # Combined motion score
-            motion_score = total_displacement + avg_frame_motion
-            motion_magnitudes.append(motion_score)
-        
-        # Simple threshold-based segmentation
-        motion_threshold = np.percentile(motion_magnitudes, 70)  # Top 30% are "moving"
-        
+
+            # Total displacement normalized by length
+            displacement = np.linalg.norm(positions[-1] - positions[0]) / len(positions)
+
+            # Frame-to-frame velocities
+            velocities = np.diff(positions, axis=0)
+            vel_mags = np.linalg.norm(velocities, axis=1)
+
+            avg_velocity = np.mean(vel_mags)
+            var_velocity = np.var(vel_mags)
+
+            # Feature vector: [displacement, avg velocity, variance]
+            features.append([displacement, avg_velocity, var_velocity])
+
+        features = np.array(features)
+
+        # Cluster into 2 groups (moving vs static)
+        kmeans = KMeans(n_clusters=2, random_state=42, n_init="auto")
+        labels = kmeans.fit_predict(features)
+
+        # Decide which cluster is "moving" (the one with higher avg displacement)
+        cluster_motion = [features[labels == k, 0].mean() for k in range(2)]
+        moving_cluster = int(np.argmax(cluster_motion))
+
         segmented_trajectories = []
         for i, traj in enumerate(trajectories_3d):
-            # Create a copy with rigid part assignment
             segmented_traj = Trajectory3D(
                 track_id=traj.track_id,
                 points=traj.points,
-                rigid_part=1 if motion_magnitudes[i] > motion_threshold else 0
+                rigid_part=1 if labels[i] == moving_cluster else 0
             )
             segmented_trajectories.append(segmented_traj)
-        
-        # Print segmentation results
+
         moving_count = sum(1 for traj in segmented_trajectories if traj.rigid_part == 1)
         static_count = len(segmented_trajectories) - moving_count
         print(f"Rigid part segmentation: {moving_count} moving, {static_count} static trajectories")
-        
+
         return segmented_trajectories
+
+
+    def _cluster_trajectories(
+        self,
+        trajectories: List[Trajectory3D],
+        eps: float = 0.05,
+        min_samples: int = 5
+    ) -> List[Trajectory3D]:
+        """
+        Cluster 3D trajectories to reduce redundancy/noise (simplified version).
+        
+        Args:
+            trajectories: List of Trajectory3D objects
+            eps: DBSCAN neighborhood size
+            min_samples: Minimum samples for a cluster
+        
+        Returns:
+            Representative trajectories (cluster medoids)
+        """
+
+        if not trajectories:
+            return trajectories
+
+        # Represent each trajectory by mean displacement vector
+        features = []
+        for traj in trajectories:
+            pts = traj.get_all_positions()
+            if len(pts) < 2:
+                features.append([0, 0, 0])
+            else:
+                disp = pts[-1] - pts[0]
+                features.append(disp / (np.linalg.norm(disp) + 1e-8))
+        features = np.array(features)
+
+        # Cluster with DBSCAN
+        clustering = DBSCAN(eps=eps, min_samples=min_samples).fit(features)
+        labels = clustering.labels_
+
+        clustered = []
+        for lbl in set(labels):
+            if lbl == -1:
+                # noise points
+                continue
+            cluster_trajs = [t for t, l in zip(trajectories, labels) if l == lbl]
+            if not cluster_trajs:
+                continue
+
+            # Pick medoid trajectory (closest to cluster mean)
+            cluster_features = [f for f, l in zip(features, labels) if l == lbl]
+            cluster_mean = np.mean(cluster_features, axis=0)
+
+            distances = [np.linalg.norm(f - cluster_mean) for f in cluster_features]
+            medoid_idx = np.argmin(distances)
+
+            clustered.append(cluster_trajs[medoid_idx])
+
+        print(f"[Clustering] Reduced {len(trajectories)} → {len(clustered)} trajectories")
+        return clustered
+  
 
     def visualize_result(self, out_dir="./saved_videos", pad_value=120, linewidth=3):
         """Visualize last predicted tracks on the original video."""
@@ -426,10 +501,7 @@ class CoTrackerRGBD:
         )
         print(f"Visualization saved to {out_dir}")
 
-        
-
     
-
 
 # Utility functions for external use
 def process_rgbd_video(video_path: str,
