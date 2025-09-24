@@ -436,36 +436,132 @@ class HingeJointModel(JointModelBase):
         
         return angle
     
-    def refine_parameters(self, 
-                         inlier_trajectories: List[Trajectory3D], 
-                         initial_params: HingeParameters) -> HingeParameters:
-        """Refine hinge parameters using all inlier trajectories."""
-        if not inlier_trajectories:
+    def refine_parameters(self,
+                          inlier_trajectories: List[Trajectory3D],
+                          initial_params: HingeParameters) -> HingeParameters:
+        """
+        Simple circular-aware refinement for hinge joints.
+        
+        For each trajectory with enough points:
+        1. Fit circle to first, middle, last points
+        2. Use circle normal as axis candidate
+        3. Average all valid axes and find pivot from centers
+        """
+        if not inlier_trajectories or len(inlier_trajectories) < 2:
             return initial_params
         
-        # Extract all point correspondences from inlier trajectories
-        all_points_t1 = []
-        all_points_t2 = []
+        valid_axes = []
+        valid_centers = []
         
+        # Try to fit circles to longer trajectories
         for traj in inlier_trajectories:
-            if len(traj.points) >= 2:
-                p1 = traj.points[0]
-                p2 = traj.points[-1]
-                all_points_t1.append([p1.x, p1.y, p1.z])
-                all_points_t2.append([p2.x, p2.y, p2.z])
+            if len(traj.points) < 5:
+                continue
+                
+            # Get 3 spread-out points from trajectory
+            points = np.array([[p.x, p.y, p.z] for p in traj.points])
+            p1 = points[0]                    # first
+            p2 = points[len(points)//2]       # middle  
+            p3 = points[-1]                   # last
+            
+            try:
+                # Simple 3-point circle fit
+                center, axis = self._fit_simple_circle(p1, p2, p3)
+                
+                # Basic validation
+                radius = np.linalg.norm(p1 - center)
+                if 0.01 < radius < 1.0:  # reasonable radius
+                    valid_axes.append(axis)
+                    valid_centers.append(center)
+                    
+            except:
+                continue
         
-        if len(all_points_t1) < 3:
-            return initial_params
+        if len(valid_axes) < 2:
+            # Fallback to simple refinement
+            all_points = []
+            for traj in inlier_trajectories:
+                all_points.extend([[p.x, p.y, p.z] for p in traj.points])
+            
+            refined_pivot = np.mean(all_points, axis=0) if all_points else initial_params.pivot
+            return HingeParameters(axis=initial_params.axis, pivot=refined_pivot)
         
-        # Re-estimate parameters with more data
-        points_t1 = np.array(all_points_t1)
-        points_t2 = np.array(all_points_t2)
+        # Average the valid axes (handle direction consistency)
+        reference_axis = valid_axes[0]
+        for i in range(1, len(valid_axes)):
+            if np.dot(valid_axes[i], reference_axis) < 0:
+                valid_axes[i] = -valid_axes[i]
         
-        try:
-            R, t, pivot, axis = self._estimate_rigid_transform(points_t1, points_t2)
-            return HingeParameters(axis=axis, pivot=pivot)
-        except:
-            return initial_params
+        refined_axis = np.mean(valid_axes, axis=0)
+        refined_axis = refined_axis / np.linalg.norm(refined_axis)
+        
+        # Pivot = average of circle centers
+        refined_pivot = np.mean(valid_centers, axis=0)
+        
+        print(f"Circle refinement: used {len(valid_axes)} trajectories")
+        return HingeParameters(axis=refined_axis, pivot=refined_pivot)
+
+    def _fit_simple_circle(self, p1: np.ndarray, p2: np.ndarray, p3: np.ndarray) -> tuple:
+        """
+        Fit circle through 3 points. Returns (center, normal).
+        """
+        # Find plane normal from cross product
+        v1 = p2 - p1
+        v2 = p3 - p1
+        normal = np.cross(v1, v2)
+        
+        if np.linalg.norm(normal) < 1e-8:
+            raise ValueError("Collinear points")
+        
+        normal = normal / np.linalg.norm(normal)
+        
+        # Find circle center using perpendicular bisectors
+        # Midpoints of two chords
+        mid12 = (p1 + p2) / 2
+        mid23 = (p2 + p3) / 2
+        
+        # Directions perpendicular to chords (in the plane)
+        dir12 = np.cross(normal, p2 - p1)
+        dir23 = np.cross(normal, p3 - p2)
+        
+        # Solve intersection of two lines: mid12 + t*dir12 = mid23 + s*dir23
+        # This is a simple 3D line intersection problem
+        
+        # Use simplified approach: center is equidistant from all 3 points
+        # Solve system: |center - p1|² = |center - p2|² = |center - p3|²
+        
+        A = 2 * np.array([p2 - p1, p3 - p1])
+        b = np.array([
+            np.dot(p2, p2) - np.dot(p1, p1),
+            np.dot(p3, p3) - np.dot(p1, p1)
+        ])
+        
+        # Project to 2D for stable solving
+        u = v1 / np.linalg.norm(v1)
+        v = np.cross(normal, u)
+        
+        # Convert to 2D coordinates
+        p1_2d = np.array([0, 0])
+        p2_2d = np.array([np.dot(p2 - p1, u), np.dot(p2 - p1, v)])
+        p3_2d = np.array([np.dot(p3 - p1, u), np.dot(p3 - p1, v)])
+        
+        # Solve 2D circle center
+        A_2d = 2 * np.array([
+            [p2_2d[0], p2_2d[1]],
+            [p3_2d[0], p3_2d[1]]
+        ])
+        b_2d = np.array([
+            p2_2d[0]**2 + p2_2d[1]**2,
+            p3_2d[0]**2 + p3_2d[1]**2
+        ])
+        
+        center_2d = np.linalg.solve(A_2d, b_2d)
+        
+        # Convert back to 3D
+        center_3d = p1 + center_2d[0] * u + center_2d[1] * v
+        
+        return center_3d, normal
+
 
 
 class SliderJointModel(JointModelBase):

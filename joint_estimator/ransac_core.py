@@ -59,8 +59,16 @@ class RANSACCore:
         
         start_time = time.time()
         
-        # Filter trajectories by minimum length
+        # # Filter trajectories by minimum length
         valid_trajectories = self._filter_trajectories(trajectories_3d)
+
+        # # Step 0: Pre-cluster trajectories with TMS
+        # clusters = self._build_tms_clusters(trajectories_3d)
+        # representatives = [self._choose_representative(c) for c in clusters]
+
+        # # Step 1: Filter representatives
+        # valid_trajectories = self._filter_trajectories(representatives)
+
         print(f"After filtering: {len(valid_trajectories)} valid trajectories")
         
         if len(valid_trajectories) < self.config.min_inliers:
@@ -118,9 +126,96 @@ class RANSACCore:
             total_trajectories=len(trajectories_3d),
             processing_time=processing_time
         )
+
+    # def _build_tms_clusters(self,
+    #                         trajectories: List[Trajectory3D],
+    #                         n_rtm: int = 100,
+    #                         eps_r: float = 0.01,
+    #                         jaccard_thresh: float = 0.7):
+    #     """
+    #     Build trajectory clusters using Trajectory-Model Signatures (TMS).
+    #     Each trajectory gets a binary signature vector describing which
+    #     rigid trajectory models (RTMs) it supports. Then cluster trajectories
+    #     based on Jaccard similarity of signatures.
+
+    #     Args:
+    #         trajectories: List of trajectories
+    #         n_rtm: Number of RTM candidates to generate
+    #         eps_r: Residual error threshold for agreement
+    #         jaccard_thresh: Jaccard distance threshold for clustering
+
+    #     Returns:
+    #         List of clusters, each a list of trajectories
+    #     """
+    #     if len(trajectories) < 2:
+    #         return [[t] for t in trajectories]
+
+    #     # --- Step 1: Generate RTM candidates ---
+    #     rtms = []
+    #     for _ in range(min(n_rtm, len(trajectories) // 2)):
+    #         t1, t2 = random.sample(trajectories, 2)
+    #         p1a = np.array([t1.points[0].x, t1.points[0].y, t1.points[0].z])
+    #         p1b = np.array([t1.points[-1].x, t1.points[-1].y, t1.points[-1].z])
+
+    #         p2a = np.array([t2.points[0].x, t2.points[0].y, t2.points[0].z])
+    #         p2b = np.array([t2.points[-1].x, t2.points[-1].y, t2.points[-1].z])
+    #         try:
+    #             R, t = self.joint_models[JointType.HINGE]._estimate_rigid_transform_kabsch(
+    #                 np.array([p1a, p2a]), np.array([p1b, p2b])
+    #             )
+    #             rtms.append((R, t))
+    #         except Exception:
+    #             continue
+
+    #     if not rtms:
+    #         return [[t] for t in trajectories]
+
+    #     # --- Step 2: Compute TMS vectors ---
+    #     signatures = {}
+    #     for traj in trajectories:
+    #         pts = traj.get_all_positions()
+    #         sig = []
+    #         for (R, t) in rtms:
+    #             if len(pts) < 2:
+    #                 sig.append(0)
+    #                 continue
+    #             pred = (R @ pts[:-1].T).T + t
+    #             res = np.mean(np.linalg.norm(pred - pts[1:], axis=1))
+    #             sig.append(1 if res < eps_r else 0)
+    #         signatures[traj.track_id] = np.array(sig, dtype=np.uint8)
+
+    #     # --- Step 3: Cluster using Jaccard similarity ---
+    #     unvisited = set(signatures.keys())
+    #     clusters = []
+
+    #     while unvisited:
+    #         seed = unvisited.pop()
+    #         cluster = [seed]
+    #         sig_seed = signatures[seed]
+
+    #         to_check = list(unvisited)
+    #         for other in to_check:
+    #             sig_other = signatures[other]
+    #             inter = np.sum(np.logical_and(sig_seed, sig_other))
+    #             union = np.sum(np.logical_or(sig_seed, sig_other))
+    #             d_j = 1.0 if union == 0 else 1 - inter / union
+    #             if d_j < jaccard_thresh:
+    #                 cluster.append(other)
+    #                 unvisited.remove(other)
+
+    #         clusters.append([traj for traj in trajectories if traj.track_id in cluster])
+
+    #     return clusters
+
+    # def _choose_representative(self, cluster: List[Trajectory3D]) -> Trajectory3D:
+    #     """
+    #     Pick representative trajectory from a cluster.
+    #     Strategy: choose the longest trajectory (most frames).
+    #     """
+    #     return max(cluster, key=lambda t: len(t.points))
     
     def _filter_trajectories(self, trajectories: List[Trajectory3D]) -> List[Trajectory3D]:
-        """Filter trajectories based on minimum length requirement."""
+        """Filter trajectories based on minimum length"""
         return [
             traj for traj in trajectories 
             if len(traj.points) >= self.config.min_trajectory_length

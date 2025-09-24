@@ -9,7 +9,7 @@ This module handles the final phase of the 4D RANSAC pipeline:
 """
 
 import numpy as np
-from typing import List, Tuple, Optional
+from typing import List
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 
@@ -115,10 +115,10 @@ class PostProcessor:
                 angle_min=0.0,
                 angle_max=0.0
             )
-        
-        all_angles = np.array(all_angles)
-        angle_min = np.min(all_angles)
-        angle_max = np.max(all_angles)
+
+        all_angles = np.unwrap(np.array(all_angles))  # ensure continuity
+        angle_min = np.percentile(all_angles, 5)   # 5th percentile
+        angle_max = np.percentile(all_angles, 98)  # 98th percentile
         
         print(f"Hinge range: {np.degrees(angle_min):.1f}° to {np.degrees(angle_max):.1f}°")
         
@@ -371,7 +371,7 @@ class PostProcessor:
                 
                 # Mark reference point
                 ax.scatter(ref_point[0], ref_point[1], ref_point[2],
-                          color='blue', s=200, marker='*', label='Reference')
+                          color='blue', s=200, marker='*', label='Pivot')
         
         # Formatting
         ax.legend()

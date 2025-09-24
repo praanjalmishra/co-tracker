@@ -15,6 +15,7 @@ import numpy as np
 import argparse
 import json
 import time
+import torch
 from pathlib import Path
 from typing import Optional
 
@@ -25,6 +26,7 @@ from data_structures import (
 from cotracker_rgbd import process_rgbd_video
 from ransac_core import estimate_joint_from_trajectories
 from post_processing import process_joint_result, visualize_joint_result
+from utils import export_joint_and_inliers
 
 
 class JointEstimator:
@@ -51,8 +53,10 @@ class JointEstimator:
     def estimate_joint_from_rgbd(self, 
                                 video_path: str,
                                 depth_dir: str,
+                                out_dir: str,
                                 camera_metadata_path: str,
-                                visualize: bool = True) -> Optional[object]:
+                                visualize: bool = True,
+                                extrinsics: Optional[torch.Tensor] = None) -> Optional[object]:
         """
         Complete pipeline: RGB-D video → Joint parameters.
         
@@ -77,18 +81,20 @@ class JointEstimator:
             trajectories_3d, camera_intrinsics = process_rgbd_video(
                 video_path=video_path,
                 depth_dir=depth_dir,
+                out_dir=out_dir,
                 camera_metadata_path=camera_metadata_path,
                 trajectory_filter_config=self.config.trajectory_filter_config,
-                grid_size=50,  # CoTracker grid size
+                grid_size=40,  # CoTracker grid size
                 backward_tracking=True
             )
             
             if len(trajectories_3d) == 0:
-                print("❌ ERROR: No valid 3D trajectories generated")
+                print("[ERROR] No valid 3D trajectories generated")
                 return None
 
             print(f"[CoTracker] Generated {len(trajectories_3d)} valid 3D trajectories")
 
+            # import pdb; pdb.set_trace()
             # Phase 2: RANSAC Joint Fitting
             print("\n PHASE 2: RANSAC Joint Fitting")
             ransac_result = estimate_joint_from_trajectories(
@@ -96,7 +102,7 @@ class JointEstimator:
             )
             
             if not ransac_result.success:
-                print(f"❌ RANSAC failed: {ransac_result.error_message}")
+                print(f"[ERROR] RANSAC failed: {ransac_result.error_message}")
                 if visualize:
                     visualize_joint_result(ransac_result, trajectories_3d, "FAILED Joint Estimation")
                 return ransac_result
@@ -104,7 +110,7 @@ class JointEstimator:
             print(f"✓ RANSAC succeeded: {ransac_result.joint_type.value} joint found")
             
             # Phase 3: Post-Processing
-            print("\n📊 PHASE 3: Post-Processing & Range Calculation")
+            print("\n PHASE 3: Post-Processing & Range Calculation")
             final_result = process_joint_result(ransac_result)
             
             total_time = time.time() - total_start_time
@@ -112,13 +118,13 @@ class JointEstimator:
             
             # Phase 4: Visualization
             if visualize:
-                print("\n📈 PHASE 4: Visualization")
+                print("\n PHASE 4: Visualization")
                 visualize_joint_result(final_result, trajectories_3d, "4D RANSAC Joint Estimation")
             
             return final_result
             
         except Exception as e:
-            print(f"❌ Pipeline failed with error: {e}")
+            print(f"[ERROR] Pipeline failed with error: {e}")
             if self.config.debug_mode:
                 import traceback
                 traceback.print_exc()
@@ -143,33 +149,33 @@ class JointEstimator:
         
         try:
             # Phase 1: RANSAC Joint Fitting
-            print("\n🎯 PHASE 1: RANSAC Joint Fitting")
+            print("\n PHASE 1: RANSAC Joint Fitting")
             ransac_result = estimate_joint_from_trajectories(
                 trajectories_3d, self.config.ransac_config
             )
             
             if not ransac_result.success:
-                print(f"❌ RANSAC failed: {ransac_result.error_message}")
+                print(f"[ERROR] RANSAC failed: {ransac_result.error_message}")
                 if visualize:
                     visualize_joint_result(ransac_result, trajectories_3d, "FAILED Joint Estimation")
                 return ransac_result
             
             # Phase 2: Post-Processing
-            print("\n📊 PHASE 2: Post-Processing & Range Calculation")
+            print("\n PHASE 2: Post-Processing & Range Calculation")
             final_result = process_joint_result(ransac_result)
             
             total_time = time.time() - total_start_time
-            print(f"🏁 PIPELINE COMPLETE in {total_time:.2f}s")
+            print(f"PIPELINE COMPLETE in {total_time:.2f}s")
             
             # Phase 3: Visualization
             if visualize:
-                print("\n📈 PHASE 3: Visualization")
+                print("\n PHASE 3: Visualization")
                 visualize_joint_result(final_result, trajectories_3d, "4D RANSAC Joint Estimation")
             
             return final_result
             
         except Exception as e:
-            print(f"❌ Pipeline failed with error: {e}")
+            print(f"[ERROR] Pipeline failed with error: {e}")
             if self.config.debug_mode:
                 import traceback
                 traceback.print_exc()
@@ -181,7 +187,7 @@ def create_pipeline_config_from_args(args) -> PipelineConfig:
     
     # Camera intrinsics
     camera_intrinsics = CameraIntrinsics(
-        fx=args.fx, fy=args.fy, cx=args.cx, cy=args.cy
+        fx=args.fx, fy=args.fy, cx=args.cx, cy=args.cy , w=args.w, h=args.h
     )
     
     # RANSAC configuration
@@ -220,6 +226,8 @@ def main():
                        help="Path to RGB video file")
     parser.add_argument("--depth_dir", type=str, required=True,
                        help="Directory containing depth images")
+    parser.add_argument("--out_dir", type=str, default="./output",
+                       help="Directory to save intermediate outputs")
     parser.add_argument("--camera_metadata", type=str, required=True,
                        help="JSON file with camera parameters")
     
@@ -234,13 +242,13 @@ def main():
                        help="Principal point Y (override metadata)")
     
     # RANSAC parameters
-    parser.add_argument("--max_iterations", type=int, default=1000,
+    parser.add_argument("--max_iterations", type=int, default=2000,
                        help="Maximum RANSAC iterations")
-    parser.add_argument("--error_threshold", type=float, default=0.05,
+    parser.add_argument("--error_threshold", type=float, default=0.03,
                        help="Error threshold for inliers (meters)")
-    parser.add_argument("--min_inliers", type=int, default=10,
+    parser.add_argument("--min_inliers", type=int, default=5,
                        help="Minimum inliers to accept model")
-    parser.add_argument("--min_trajectory_length", type=int, default=5,
+    parser.add_argument("--min_trajectory_length", type=int, default=20,
                        help="Minimum trajectory length")
     parser.add_argument("--early_termination_threshold", type=float, default=0.8,
                        help="Early termination consensus threshold")
@@ -254,8 +262,7 @@ def main():
     # Output and visualization
     parser.add_argument("--no_viz", action="store_true",
                        help="Disable 3D visualization")
-    parser.add_argument("--output_json", type=str, default=None,
-                       help="Output JSON file for results")
+
     parser.add_argument("--debug", action="store_true",
                        help="Enable debug mode")
     
@@ -263,18 +270,17 @@ def main():
     
     # Validate input files
     if not Path(args.video_path).exists():
-        print(f"❌ ERROR: Video file not found: {args.video_path}")
+        print(f"[ERROR] Video file not found: {args.video_path}")
         return 1
     
     if not Path(args.depth_dir).exists():
-        print(f"❌ ERROR: Depth directory not found: {args.depth_dir}")
+        print(f"[ERROR] Depth directory not found: {args.depth_dir}")
         return 1
     
     if not Path(args.camera_metadata).exists():
-        print(f"ERROR: Camera metadata file not found: {args.camera_metadata}")
+        print(f"[ERROR] Camera metadata file not found: {args.camera_metadata}")
         return 1
     
-    # Load camera parameters from metadata if not overridden
     if any(param is None for param in [args.fx, args.fy, args.cx, args.cy]):
         try:
             with open(args.camera_metadata, 'r') as f:
@@ -284,121 +290,146 @@ def main():
             args.fy = args.fy or metadata["fl_y"]
             args.cx = args.cx or metadata["cx"]
             args.cy = args.cy or metadata["cy"]
+            args.w = metadata.get("w", None)
+            args.h = metadata.get("h", None)
+
+            if "frames" in metadata and len(metadata["frames"]) > 0:
+                args.extrinsics = torch.tensor(
+                    metadata["frames"][0]["transform_matrix"],
+                    dtype=torch.float32
+                )
             
         except Exception as e:
             print(f"ERROR: Failed to load camera parameters: {e}")
             return 1
     
-    # Create pipeline configuration
+    # Create pipeline config
     config = create_pipeline_config_from_args(args)
     
-    # Initialize joint estimator
+    # Initialize estimator
     estimator = JointEstimator(config)
     
     # Run the pipeline
     result = estimator.estimate_joint_from_rgbd(
         video_path=args.video_path,
         depth_dir=args.depth_dir,
+        out_dir=args.out_dir, 
         camera_metadata_path=args.camera_metadata,
-        visualize=not args.no_viz
+        visualize=not args.no_viz,
+        extrinsics=args.extrinsics
     )
     
     if result is None:
         return 1
     
-    # Save results to JSON if requested
-    if args.output_json and result.success:
-        save_result_to_json(result, args.output_json)
-        print(f"Results saved to: {args.output_json}")
-    
+    if args.out_dir and result.success:
+        save_result_to_json(result, Path(args.out_dir) / "joint_schemas.json")
+        print(f"Results saved to: {Path(args.out_dir) / 'joint_schemas.json'}")
+
+
+    if args.out_dir:
+        export_joint_and_inliers(
+            result=result,
+            inlier_trajectories=result.inlier_trajectories,
+            extrinsics=args.extrinsics,
+            output_dir=args.out_dir,
+            filename_prefix="prismatic" if result.joint_type.value == "slider" else "revolute"
+        )
+
     return 0 if result.success else 1
 
 
 def save_result_to_json(result, output_path: str):
-    """Save joint estimation result to JSON file."""
-    output_data = {
-        "success": result.success,
-        "joint_type": result.joint_type.value,
-        "confidence": result.confidence,
-        "processing_time": result.processing_time,
-        "inlier_count": len(result.inlier_trajectories),
-        "total_trajectories": result.total_trajectories
-    }
-    
+    """Save joint estimation result to JSON file (Joint_schema.json format)."""
+
+    joints_out = []
+
     if result.success:
-        if result.joint_type.value == "hinge":
+        if result.joint_type.value == "hinge":  # revolute
             hinge_params = result.get_hinge_params()
-            output_data["parameters"] = {
-                "axis": hinge_params.axis.tolist(),
-                "pivot": hinge_params.pivot.tolist(),
-                "angle_min_deg": float(np.degrees(hinge_params.angle_min)) if hinge_params.angle_min is not None else None,
-                "angle_max_deg": float(np.degrees(hinge_params.angle_max)) if hinge_params.angle_max is not None else None,
-                "range_deg": float(np.degrees(hinge_params.angle_max - hinge_params.angle_min)) if hinge_params.angle_min is not None and hinge_params.angle_max is not None else None
+            joint_data = {
+                "joint_type": "revolute",
+                "joint_axis": hinge_params.axis.tolist(),
+                "joint_pivot": hinge_params.pivot.tolist(),
+                "joint_limits": [
+                    float(np.degrees(hinge_params.angle_min)) if hinge_params.angle_min is not None else None,
+                    float(np.degrees(hinge_params.angle_max)) if hinge_params.angle_max is not None else None
+                ]
             }
-        elif result.joint_type.value == "slider":
+            joints_out.append(joint_data)
+
+        elif result.joint_type.value == "slider":  # prismatic
             slider_params = result.get_slider_params()
-            output_data["parameters"] = {
-                "direction": slider_params.direction.tolist(),
-                "reference_point": slider_params.reference_point.tolist() if slider_params.reference_point is not None else None,
-                "translation_min": slider_params.translation_min,
-                "translation_max": slider_params.translation_max,
-                "range": slider_params.translation_max - slider_params.translation_min if slider_params.translation_min is not None and slider_params.translation_max is not None else None
+            joint_data = {
+                "joint_type": "prismatic",
+                "joint_axis": slider_params.direction.tolist(),
+                "joint_pivot": (
+                    slider_params.reference_point.tolist()
+                    if slider_params.reference_point is not None
+                    else [0, 0, 0]
+                ),
+                "joint_limits": [
+                    slider_params.translation_min,
+                    slider_params.translation_max
+                ]
             }
-    
+            joints_out.append(joint_data)
+
     with open(output_path, 'w') as f:
-        json.dump(output_data, f, indent=2)
+        json.dump(joints_out, f, indent=2)
 
 
-# Example usage functions
-def example_usage_rgbd():
-    """Example of using the pipeline with RGB-D data."""
-    # Create configuration
-    config = create_default_config(
-        fx=525.0, fy=525.0, cx=319.5, cy=239.5  # Example Kinect parameters
-    )
+
+# # Example usage functions
+# def example_usage_rgbd():
+#     """Example of using the pipeline with RGB-D data."""
+#     # Create configuration
+#     config = create_default_config(
+#         fx=525.0, fy=525.0, cx=319.5, cy=239.5  # Example Kinect parameters
+#     )
     
-    # Adjust RANSAC parameters for your specific use case
-    config.ransac_config.max_iterations = 500
-    config.ransac_config.error_threshold = 0.08  # 8cm tolerance
-    config.ransac_config.min_inliers = 8
+#     # Adjust RANSAC parameters for your specific use case
+#     config.ransac_config.max_iterations = 500
+#     config.ransac_config.error_threshold = 0.08  # 8cm tolerance
+#     config.ransac_config.min_inliers = 8
     
-    # Initialize estimator
-    estimator = JointEstimator(config)
+#     # Initialize estimator
+#     estimator = JointEstimator(config)
     
-    # Run pipeline
-    result = estimator.estimate_joint_from_rgbd(
-        video_path="path/to/video.mp4",
-        depth_dir="path/to/depth_images/",
-        camera_metadata_path="path/to/camera_metadata.json",
-        visualize=True
-    )
+#     # Run pipeline
+#     result = estimator.estimate_joint_from_rgbd(
+#         video_path="path/to/video.mp4",
+#         depth_dir="path/to/depth_images/",
+#         camera_metadata_path="path/to/camera_metadata.json",
+#         visualize=True
+#     )
     
-    return result
+#     return result
 
 
-def example_usage_synthetic():
-    """Example of using the pipeline with synthetic trajectory data."""
-    # This is what you've been testing with
-    from test_ransac import make_hinge_trajectories
-    import numpy as np
+# def example_usage_synthetic():
+#     """Example of using the pipeline with synthetic trajectory data."""
+#     # This is what you've been testing with
+#     from test_ransac import make_hinge_trajectories
+#     import numpy as np
     
-    # Create synthetic data
-    true_axis = np.array([0, 0, 1])
-    true_pivot = np.array([0, 0, 0])
-    angles = np.linspace(0, np.pi/3, 15)
-    trajectories = make_hinge_trajectories(true_axis, true_pivot, angles, n_points=20, noise=0.02)
+#     # Create synthetic data
+#     true_axis = np.array([0, 0, 1])
+#     true_pivot = np.array([0, 0, 0])
+#     angles = np.linspace(0, np.pi/3, 15)
+#     trajectories = make_hinge_trajectories(true_axis, true_pivot, angles, n_points=20, noise=0.02)
     
-    # Create configuration
-    config = create_default_config(fx=525, fy=525, cx=320, cy=240)
-    config.ransac_config.error_threshold = 0.1  # More permissive for synthetic data
+#     # Create configuration
+#     config = create_default_config(fx=525, fy=525, cx=320, cy=240)
+#     config.ransac_config.error_threshold = 0.1  # More permissive for synthetic data
     
-    # Initialize estimator  
-    estimator = JointEstimator(config)
+#     # Initialize estimator  
+#     estimator = JointEstimator(config)
     
-    # Run estimation
-    result = estimator.estimate_joint_from_trajectories(trajectories, visualize=True)
+#     # Run estimation
+#     result = estimator.estimate_joint_from_trajectories(trajectories, visualize=True)
     
-    return result
+#     return result
 
 
 if __name__ == "__main__":
